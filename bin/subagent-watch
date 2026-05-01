@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# subagent-watch <claude-pid>
+#
+# Watches the subagents dir of the claude session owned by <claude-pid>
+# and maintains the right-column layout described below. Designed to be
+# fork-and-detached by `claude-j` and to die when claude dies.
+#
+# Layout:
+#   ┌────────────────────────┬───────┐
+#   │                        │ agent1│ ← first subagent splits right (~2/7)
+#   │                        ├───────┤
+#   │     claude main        │ agent2│ ← subsequent stack downward
+#   │      (~5/7 wide)       ├───────┤
+#   │                        │ agent3│
+#   └────────────────────────┴───────┘
+#
+# Lifecycle:
+#   - When a new agent-<id>.meta.json appears with non-empty jsonl, open a pane.
+#   - The renderer in that pane self-exits after 30 min of no new lines
+#     (configurable via SUBAGENT_IDLE_CLOSE_SECS). --close-on-exit collapses
+#     the pane.
+#   - The renderer maintains an .alive-<id> sentinel; if it's missing AND
+#     the agent's jsonl size grows, we re-spawn its pane.
+set -uo pipefail
+
+PID=${1:?usage: subagent-watch <claude-pid>}
+[ -z "${ZELLIJ:-}" ] && exit 0
+
+# --- wait for claude to register its session ---------------------------------
+SESSION=""
+for _ in $(seq 1 60); do
+  kill -0 "$PID" 2>/dev/null || exit 0
+  SF="$HOME/.claude/sessions/$PID.json"
+  if [ -f "$SF" ]; then
+    SESSION=$(jq -r '.sessionId // empty' "$SF" 2>/dev/null || true)
+    [ -n "$SESSION" ] && break
+  fi
+  sleep 0.5
+done
+[ -z "$SESSION" ] && exit 0
+
+PROJ="$HOME/.claude/projects/$(printf '%s' "$PWD" | sed 's|/|-|g')"
+WATCH_DIR="$PROJ/$SESSION/subagents"
+mkdir -p "$WATCH_DIR"
+
+# --- state -------------------------------------------------------------------
+HAS_COL=0                # 1 once the right column exists
+declare -A LAST_SIZE     # agent_id -> jsonl size at last spawn
+declare -A FIRST_SEEN    # agent_id -> 1 once we've ever seen this agent
+
+# Number of resize-decrease-left steps to take the first right pane from the
+# default 50% split to ~29% (= 2/7). Each step is roughly 5%, so 4 steps ≈ 20%
+# reduction → ~30% remaining. Tunable.
+RESIZE_STEPS=${SUBAGENT_RESIZE_STEPS:-4}
+
+run_render_pane() {
+  # Args: agent_id, direction (Right|Down)
+  # Echoes the new pane id (terminal_<n>) on success, or empty on failure.
+  local aid=$1 dir=$2
+  zellij run \
+    --direction "$dir" \
+    --name "agent:${aid:0:8}" \
+    --close-on-exit \
+    -- "$HOME/bin/subagent-render" --agent "$aid" "$SESSION" 2>&1 |
+      grep -oE 'terminal_[0-9]+' | head -1
+}
+
+shrink_to_fifth() {
+  local pid=$1
+  local i
+  for i in $(seq 1 "$RESIZE_STEPS"); do
+    zellij action resize decrease left -p "$pid" >/dev/null 2>&1 || break
+  done
+}
+
+focus_right_column_bottom() {
+  # From wherever focus is, walk into right column and down to bottom.
+  zellij action move-focus right >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 12); do
+    zellij action move-focus down >/dev/null 2>&1 || true
+  done
+}
+
+return_focus_to_main() {
+  # Best-effort: walk left several times. zellij stops at the leftmost.
+  local i
+  for i in 1 2 3 4; do
+    zellij action move-focus left >/dev/null 2>&1 || true
+  done
+}
+
+spawn_pane_for() {
+  local aid=$1
+  local pid
+  if [ "$HAS_COL" = "0" ]; then
+    pid=$(run_render_pane "$aid" Right) || return 1
+    [ -z "$pid" ] && return 1
+    shrink_to_fifth "$pid"
+    HAS_COL=1
+    return_focus_to_main
+  else
+    focus_right_column_bottom
+    pid=$(run_render_pane "$aid" Down) || return 1
+    [ -z "$pid" ] && return 1
+    # Equal-height invariant: every spawn produces a "split bottom in half"
+    # which makes heights like {1/2, 1/4, 1/4}. Rebalance resets all
+    # agent:* panes to total_column_height / N.
+    "$HOME/bin/subagent-rebalance" >/dev/null 2>&1 || true
+    return_focus_to_main
+  fi
+}
+
+# --- main loop ---------------------------------------------------------------
+while kill -0 "$PID" 2>/dev/null; do
+  for jl in "$WATCH_DIR"/agent-*.jsonl; do
+    [ -f "$jl" ] || continue
+    aid=${jl##*/agent-}
+    aid=${aid%.jsonl}
+    size=$(stat -f '%z' "$jl" 2>/dev/null || echo 0)
+    alive_file="$WATCH_DIR/.alive-${aid}"
+
+    if [ -z "${FIRST_SEEN[$aid]:-}" ]; then
+      # never seen — spawn only once content exists, so we don't open
+      # empty panes for stillborn agents.
+      if [ "$size" -gt 0 ]; then
+        FIRST_SEEN[$aid]=1
+        LAST_SIZE[$aid]=$size
+        spawn_pane_for "$aid"
+      fi
+    elif [ ! -f "$alive_file" ] && [ "$size" -gt "${LAST_SIZE[$aid]:-0}" ]; then
+      # pane has died (idle close) AND agent produced new output — wake up
+      LAST_SIZE[$aid]=$size
+      spawn_pane_for "$aid"
+    elif [ -f "$alive_file" ]; then
+      # live renderer is consuming this jsonl — track its growth
+      LAST_SIZE[$aid]=$size
+    fi
+  done
+  sleep 0.5
+done
+
+# claude is gone; mop up alive sentinels we no longer care about
+rm -f "$WATCH_DIR"/.alive-* 2>/dev/null || true

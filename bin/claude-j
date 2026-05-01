@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# claude-j — like `claude`, but every subagent it spawns gets its own
+# zellij pane (auto-opened, isolated stream) in a stacked right column.
+#
+# Mechanism: fork a watcher pinned to our pid, then exec the real claude.
+# After exec, our pid IS claude's pid. The watcher polls
+# ~/.claude/sessions/<pid>.json to learn the sessionId, then watches
+# <project>/<session>/subagents/ for new agent-*.meta.json files. The
+# first subagent splits Right (carving out a ~2/7-wide column); each
+# subsequent one splits Down inside that column, then subagent-rebalance
+# equalises heights. No claude internals are touched; the on-disk
+# artifacts are claude's own spawn signal.
+set -euo pipefail
+
+if [ -z "${ZELLIJ:-}" ]; then
+  echo "claude-j: not inside a zellij session." >&2
+  echo "         start zellij first (e.g.  zellij  ), then re-run claude-j." >&2
+  exit 1
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claude-j: 'claude' not found on PATH" >&2
+  exit 1
+fi
+
+# Name the current pane so the user can identify "main" in zellij UI.
+# (Cosmetic; the watcher uses direction-based focus, not pane names.)
+zellij action rename-pane "claude-main" >/dev/null 2>&1 || true
+
+# Fire-and-forget watcher. Pass our pid (which becomes claude's pid post-exec).
+# setsid-like detach: redirect everything and disown so it survives the exec.
+"$HOME/bin/subagent-watch" "$$" </dev/null >/dev/null 2>&1 &
+disown
+
+# Hand ourselves over to real claude. Same pid → session file matches.
+exec claude "$@"

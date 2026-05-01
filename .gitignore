@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+demo/*.cast
+!demo/.gitkeep
+scan-pii.sh

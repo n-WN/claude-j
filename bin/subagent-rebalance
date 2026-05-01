@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+subagent-rebalance: equalise heights of all `agent:*`-named panes in the
+current zellij tab.
+
+Why this exists: zellij's `resize` is purely incremental (no absolute
+target), and `zellij run --direction Down` always halves the focused
+pane. So spawning N agents by repeated split gives heights like
+{1/2, 1/4, 1/4} instead of {1/3, 1/3, 1/3}. We rebalance after each
+spawn by iteratively nudging each pane's down-border toward total/N.
+
+Invoked by subagent-watch after every successful pane spawn.
+"""
+import json
+import subprocess
+import sys
+import time
+
+NAME_PREFIX = "agent:"
+MAX_ITER_PER_PANE = 25
+# Empirical: zellij 0.44's resize step is ~5% of pane height (≈3 rows on
+# a 60-row column). Setting tolerance below that just causes oscillation.
+TOLERANCE_ROWS = 2
+
+
+def zj(*args, capture=True):
+    r = subprocess.run(
+        ["zellij", "action", *args],
+        capture_output=capture, text=True
+    )
+    return r.stdout if capture else ""
+
+
+def list_agent_panes():
+    """Field names verified against zellij 0.44 live output:
+      id (int), title (str), pane_y (int), pane_rows (int),
+      is_plugin (bool), is_floating (bool), is_suppressed (bool),
+      exited (bool).
+    The `id` field is a bare integer that collides between the plugin
+    and terminal namespaces — we always rebuild the canonical
+    'terminal_<id>' form for use with `resize -p`.
+    """
+    raw = zj("list-panes", "--json", "--geometry", "--state")
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    panes = []
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        if p.get("is_plugin") or p.get("is_floating") or p.get("is_suppressed"):
+            continue
+        if p.get("exited"):
+            continue
+        title = p.get("title") or ""
+        if not title.startswith(NAME_PREFIX):
+            continue
+        pid = p.get("id")
+        if not isinstance(pid, int):
+            continue
+        panes.append({
+            "id": f"terminal_{pid}",
+            "title": title,
+            "y": p.get("pane_y", 0),
+            "height": p.get("pane_rows", 0),
+        })
+    panes.sort(key=lambda p: p["y"])
+    return panes
+
+
+def height_of(pid: str) -> int:
+    for p in list_agent_panes():
+        if p["id"] == pid:
+            return p["height"]
+    return 0
+
+
+def nudge(pid: str, direction: str):
+    """direction: 'decrease' to shrink the pane (give rows to the one below),
+    or 'increase' to grow it (take rows from the one below)."""
+    zj("resize", direction, "down", "-p", pid, capture=False)
+
+
+def rebalance():
+    panes = list_agent_panes()
+    if len(panes) < 2:
+        return
+    total = sum(p["height"] for p in panes)
+    if total <= 0:
+        return
+    target = total // len(panes)
+
+    # Work top-to-bottom on all but the last; the last one absorbs the
+    # leftover rows naturally because its top neighbour's down-border is
+    # what we control.
+    for p in panes[:-1]:
+        last = -1
+        for _ in range(MAX_ITER_PER_PANE):
+            cur = height_of(p["id"])
+            if cur == 0:
+                break
+            diff = cur - target
+            if abs(diff) <= TOLERANCE_ROWS:
+                break
+            if cur == last:
+                # resize stopped responding (hit a min/max) — give up on this pane
+                break
+            last = cur
+            nudge(p["id"], "decrease" if diff > 0 else "increase")
+            time.sleep(0.02)
+
+
+if __name__ == "__main__":
+    try:
+        rebalance()
+    except Exception as e:
+        # Never fail the watcher because of rebalance issues.
+        print(f"subagent-rebalance: {e}", file=sys.stderr)
+        sys.exit(0)

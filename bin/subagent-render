@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+subagent-render: tail and pretty-print Claude Code subagent transcripts.
+
+Watches ~/.claude/projects/<cwd-encoded>/<session>/subagents/agent-*.jsonl
+and renders user/assistant/tool_use/tool_result events as they stream in.
+
+Usage:
+  subagent-render                       # auto-detect: latest session for $PWD
+  subagent-render <session_id>          # explicit session, follow ALL agents
+  subagent-render --agent <id> <sess>   # follow ONLY one agent (per-pane mode)
+  subagent-render --list                # list active subagents and exit
+"""
+import sys
+import os
+import json
+import time
+import atexit
+import signal
+import pathlib
+
+IDLE_CLOSE_SECS = int(os.environ.get("SUBAGENT_IDLE_CLOSE_SECS", "1800"))
+
+HOME = pathlib.Path.home()
+PROJECTS = HOME / ".claude" / "projects"
+
+R = "\x1b[0m"
+DIM = "\x1b[2m"
+BOLD = "\x1b[1m"
+CYAN = "\x1b[36m"
+YELLOW = "\x1b[33m"
+GREEN = "\x1b[32m"
+MAGENTA = "\x1b[35m"
+RED = "\x1b[31m"
+BLUE = "\x1b[34m"
+
+
+def encoded_cwd() -> str:
+    return os.environ.get("PWD", os.getcwd()).replace("/", "-")
+
+
+def project_dir() -> pathlib.Path:
+    return PROJECTS / encoded_cwd()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return pid == os.getpid() or False
+    except Exception:
+        return False
+
+
+def detect_session_via_ancestry() -> str | None:
+    """Walk up our process tree to find a claude PID. Works only when
+    we're a (grand)child of the claude process, e.g. invoked from its
+    Bash tool. Useless from a sibling zellij pane."""
+    sessions_dir = HOME / ".claude" / "sessions"
+    pid = os.getppid()
+    for _ in range(8):
+        if pid in (0, 1):
+            break
+        sf = sessions_dir / f"{pid}.json"
+        if sf.exists():
+            try:
+                return json.loads(sf.read_text()).get("sessionId")
+            except Exception:
+                pass
+        try:
+            with os.popen(f"ps -o ppid= -p {pid}") as p:
+                parent = p.read().strip()
+            pid = int(parent) if parent else 0
+        except Exception:
+            break
+    return None
+
+
+def detect_session_via_sessions_dir() -> str | None:
+    """Scan ~/.claude/sessions/*.json for live claude processes whose
+    cwd matches $PWD; pick the one with newest updatedAt. Works from
+    any shell in the same directory as the active claude."""
+    sessions_dir = HOME / ".claude" / "sessions"
+    if not sessions_dir.is_dir():
+        return None
+    cwd = os.environ.get("PWD") or os.getcwd()
+    best_id, best_ts = None, -1
+    for f in sessions_dir.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        if d.get("cwd") != cwd:
+            continue
+        pid = d.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        ts = d.get("updatedAt") or 0
+        if ts > best_ts:
+            best_id, best_ts = d.get("sessionId"), ts
+    return best_id
+
+
+def latest_session(pdir: pathlib.Path) -> str | None:
+    """Fallback: pick session whose most recent USER-typed message is newest.
+
+    Used only when ancestry walk fails (e.g., script invoked outside a
+    claude session). mtime alone is unreliable because claude touches
+    old session files for bookkeeping.
+    """
+    best_id, best_ts = None, ""
+    for jl in pdir.glob("*.jsonl"):
+        try:
+            with open(jl, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 200_000))
+                tail = f.read().decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in reversed(tail.splitlines()):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") == "user" and isinstance(
+                (d.get("message") or {}).get("content"), str
+            ):
+                ts = d.get("timestamp") or ""
+                if ts > best_ts:
+                    best_id, best_ts = jl.stem, ts
+                break
+    return best_id
+
+
+def auto_session() -> str | None:
+    return (
+        detect_session_via_ancestry()
+        or detect_session_via_sessions_dir()
+        or latest_session(project_dir())
+    )
+
+
+def truncate(s, n=200):
+    s = str(s).replace("\n", " ").replace("\r", " ")
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def fmt_input(name: str, inp) -> str:
+    if not isinstance(inp, dict):
+        return truncate(inp, 140)
+    for k in ("description", "command", "prompt", "file_path", "pattern", "url", "query"):
+        if k in inp and inp[k]:
+            return truncate(inp[k], 140)
+    return truncate(json.dumps(inp, ensure_ascii=False), 140)
+
+
+def render(agent_tag: str, line: str):
+    try:
+        d = json.loads(line)
+    except Exception:
+        return
+    msg = d.get("message") or {}
+    role = msg.get("role") or d.get("type")
+    content = msg.get("content")
+    tag = f"{DIM}[{agent_tag}]{R}"
+
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "text":
+                color = CYAN if role == "assistant" else GREEN
+                print(f"{tag} {color}{role}{R} {truncate(c.get('text',''))}", flush=True)
+            elif t == "tool_use":
+                name = c.get("name", "?")
+                summary = fmt_input(name, c.get("input"))
+                print(f"{tag} {YELLOW}→ {name}{R} {summary}", flush=True)
+            elif t == "tool_result":
+                tid = (c.get("tool_use_id") or "")[-6:]
+                inner = c.get("content")
+                if isinstance(inner, list):
+                    parts = []
+                    for x in inner:
+                        if not isinstance(x, dict):
+                            continue
+                        if x.get("type") == "text":
+                            parts.append(x.get("text", ""))
+                        elif x.get("type") == "image":
+                            parts.append("[image]")
+                    body = " ".join(parts)
+                else:
+                    body = str(inner) if inner is not None else ""
+                color = RED if c.get("is_error") else MAGENTA
+                print(f"{tag} {color}← {tid}{R} {truncate(body, 200)}", flush=True)
+            elif t == "thinking":
+                print(f"{tag} {DIM}thinking…{R}", flush=True)
+    elif isinstance(content, str):
+        print(f"{tag} {GREEN}{role}{R} {truncate(content)}", flush=True)
+
+
+def list_agents(sub_dir: pathlib.Path):
+    if not sub_dir.exists():
+        print(f"no subagents dir: {sub_dir}", file=sys.stderr)
+        return
+    for meta in sorted(sub_dir.glob("agent-*.meta.json")):
+        aid = meta.name.removeprefix("agent-").removesuffix(".meta.json")
+        try:
+            m = json.loads(meta.read_text())
+        except Exception:
+            m = {}
+        jl = sub_dir / f"agent-{aid}.jsonl"
+        size = jl.stat().st_size if jl.exists() else 0
+        print(f"{aid}  {m.get('agentType','?'):<18}  {size:>7}B  {m.get('description','')}")
+
+
+def follow_one(sub_dir: pathlib.Path, agent_id: str):
+    """Per-pane mode: render exactly one agent's stream and nothing else.
+
+    Writes <sub_dir>/.alive-<agent> on start (so the watcher knows a pane
+    is live for this agent) and removes it on any exit. Self-terminates
+    if no new lines arrive for IDLE_CLOSE_SECS — combined with zellij's
+    --close-on-exit this auto-closes the pane after idleness.
+    """
+    meta_path = sub_dir / f"agent-{agent_id}.meta.json"
+    jl_path = sub_dir / f"agent-{agent_id}.jsonl"
+    alive_path = sub_dir / f".alive-{agent_id}"
+    short = agent_id[:8]
+
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        alive_path.write_text(str(os.getpid()))
+    except Exception:
+        pass
+
+    def _cleanup():
+        try:
+            alive_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
+
+    # wait briefly for the meta file
+    for _ in range(40):
+        if meta_path.exists():
+            break
+        time.sleep(0.25)
+    try:
+        m = json.loads(meta_path.read_text())
+    except Exception:
+        m = {}
+    print(
+        f"{BOLD}{BLUE}[{short}]{R} {m.get('agentType','?')} — "
+        f"{m.get('description','(no description)')}  "
+        f"{DIM}(idle close: {IDLE_CLOSE_SECS}s){R}",
+        flush=True,
+    )
+
+    fp = None
+    last_data_ts = time.time()
+    try:
+        while True:
+            if fp is None and jl_path.exists():
+                fp = open(jl_path, "r", encoding="utf-8", errors="replace")
+            if fp is not None:
+                while True:
+                    line = fp.readline()
+                    if not line:
+                        break
+                    render(short, line)
+                    last_data_ts = time.time()
+            if time.time() - last_data_ts > IDLE_CLOSE_SECS:
+                print(
+                    f"{DIM}[{short}]{R} {DIM}idle for "
+                    f"{IDLE_CLOSE_SECS}s — closing pane{R}",
+                    flush=True,
+                )
+                return
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    args = sys.argv[1:]
+    if "--list" in args:
+        sid = next((a for a in args if a != "--list"), None) or auto_session()
+        if not sid:
+            sys.exit("no session found")
+        list_agents(project_dir() / sid / "subagents")
+        return
+
+    if "--agent" in args:
+        i = args.index("--agent")
+        agent_id = args[i + 1]
+        rest = args[:i] + args[i + 2:]
+        session_id = rest[0] if rest else auto_session()
+        if not session_id:
+            sys.exit("no session id (pass one or run inside a claude session)")
+        follow_one(project_dir() / session_id / "subagents", agent_id)
+        return
+
+    session_id = args[0] if args else auto_session()
+    if not session_id:
+        sys.exit(f"no session jsonl in {project_dir()}")
+    sub_dir = project_dir() / session_id / "subagents"
+
+    print(f"{BOLD}subagent-render{R} {DIM}session={session_id[:8]}  dir={sub_dir}{R}")
+    sys.stdout.flush()
+
+    handles: dict[str, object] = {}
+    seen_meta: set[str] = set()
+    try:
+        while True:
+            if sub_dir.exists():
+                for meta in sub_dir.glob("agent-*.meta.json"):
+                    aid = meta.name.removeprefix("agent-").removesuffix(".meta.json")
+                    if aid in seen_meta:
+                        continue
+                    seen_meta.add(aid)
+                    try:
+                        m = json.loads(meta.read_text())
+                    except Exception:
+                        m = {}
+                    print(
+                        f"{BOLD}{BLUE}[{aid[:8]}]{R} agent started — "
+                        f"type={m.get('agentType','?')}  desc={m.get('description','')}",
+                        flush=True,
+                    )
+                for jl in sub_dir.glob("agent-*.jsonl"):
+                    aid = jl.name.removeprefix("agent-").removesuffix(".jsonl")[:8]
+                    key = str(jl)
+                    f = handles.get(key)
+                    if f is None:
+                        f = open(jl, "r", encoding="utf-8", errors="replace")
+                        handles[key] = f
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            break
+                        render(aid, line)
+            time.sleep(0.4)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

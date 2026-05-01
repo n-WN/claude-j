@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# subagent-pane — split a zellij pane that renders this session's subagent activity.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF' >&2
+usage: subagent-pane [-d right|down|left|up] [--float] [--list] [SESSION_ID]
+
+Splits a zellij pane running `subagent-render` against the current Claude
+Code session (auto-detected as the latest-mtime jsonl in $PWD's project
+dir) or an explicitly passed SESSION_ID.
+
+  -d DIR      split direction (default: right)
+  --float     open as a floating pane instead of split
+  --list      run `subagent-render --list` once in the new pane (no follow)
+  -h          this help
+EOF
+  exit 64
+}
+
+[ -z "${ZELLIJ:-}" ] && { echo "subagent-pane: must run inside a zellij session" >&2; exit 1; }
+
+DIR=right
+FLOAT=0
+LIST=0
+SESSION=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) DIR=$2; shift 2;;
+    --float) FLOAT=1; shift;;
+    --list) LIST=1; shift;;
+    -h|--help) usage;;
+    -*) echo "unknown flag: $1" >&2; usage;;
+    *) SESSION=$1; shift;;
+  esac
+done
+
+# Detect session id. Two strategies:
+# 1) walk parent chain — works only when invoked from the claude pane's Bash
+# 2) scan ~/.claude/sessions/*.json for live PIDs with cwd==$PWD,
+#    pick newest updatedAt — works from any sibling zellij pane
+if [ -z "$SESSION" ]; then
+  PID=$PPID
+  for _ in 1 2 3 4 5 6 7 8; do
+    [ -z "$PID" ] || [ "$PID" = "1" ] && break
+    SF="$HOME/.claude/sessions/$PID.json"
+    if [ -f "$SF" ]; then
+      SESSION=$(jq -r '.sessionId // empty' "$SF" 2>/dev/null)
+      [ -n "$SESSION" ] && break
+    fi
+    PID=$(ps -o ppid= -p "$PID" 2>/dev/null | tr -d ' ')
+  done
+fi
+if [ -z "$SESSION" ]; then
+  SESSION=$(
+    for f in "$HOME"/.claude/sessions/*.json; do
+      [ -f "$f" ] || continue
+      jq -r --arg cwd "$PWD" '
+        select(.cwd == $cwd) |
+        [(.updatedAt // 0), .pid, .sessionId] | @tsv
+      ' "$f" 2>/dev/null
+    done | while IFS=$'\t' read -r ts pid sid; do
+      kill -0 "$pid" 2>/dev/null && printf '%s\t%s\n' "$ts" "$sid"
+    done | sort -rn | head -1 | cut -f2
+  )
+fi
+[ -z "$SESSION" ] && { echo "subagent-pane: could not detect current session — pass SESSION_ID explicitly" >&2; exit 1; }
+
+ZARGS=(--name subagents)
+if [ "$FLOAT" = 1 ]; then
+  ZARGS+=(--floating)
+else
+  ZARGS+=(--direction "$DIR")
+fi
+
+CMD=("$HOME/bin/subagent-render")
+[ "$LIST" = 1 ] && CMD+=(--list)
+[ -n "$SESSION" ] && CMD+=("$SESSION")
+
+zellij run "${ZARGS[@]}" -- "${CMD[@]}"
