@@ -20,7 +20,13 @@ resumes → pane re-opens.
 
 ## Demo
 
-> _Asciinema cast goes here once recorded — see [`demo/record.sh`](demo/record.sh)._
+![claude-j demo](demo/demo.gif)
+
+[Replay the asciinema cast](demo/claude-j.cast) (open in any terminal with
+`asciinema play demo/claude-j.cast`).
+
+To re-record, run [`bash demo/record.sh`](demo/record.sh) from a plain
+terminal (outside of any existing zellij session).
 
 ## Why
 
